@@ -2,6 +2,8 @@ import os
 from typing import Dict
 import time
 
+from absl import app
+from absl import flags
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,13 +16,24 @@ from data_pipeline.data_reading import get_paths
 from data_pipeline.vocab import Vocabs
 from data_pipeline.dataset import PAD, EOS, UNK, PAD_IDX
 from data_pipeline.dataset import AMRDataset
-
+from config import get_default_config
 from models import Seq2seq
 
-BATCH_SIZE = 32
-DEV_BATCH_SIZE = 32
-NO_EPOCHS = 20
-
+FLAGS = flags.FLAGS
+flags.DEFINE_string('config',
+                    default=None,
+                    help=('Config file to overwrite default configs.'))
+flags.DEFINE_integer('batch_size',
+                     default=32,
+                     short_name='b',
+                     help=('Batch size.'))
+flags.DEFINE_integer('dev_batch_size',
+                     default=32,
+                     help=('Dev batch size.'))
+flags.DEFINE_integer('no_epochs',
+                     short_name='e',
+                     default=20,
+                     help=('Number of epochs.'))
 
 def compute_loss(criterion, logits, gold_outputs):
     """Computes cross entropy loss.
@@ -43,7 +56,7 @@ def compute_loss(criterion, logits, gold_outputs):
     return loss
 
 
-def compute_fScore(gold_outputs, predicted_outputs):
+def compute_fScore(gold_outputs, predicted_outputs, vocabs: Vocabs):
     """Computes f_score, precision, recall.
 
   Args:
@@ -129,6 +142,7 @@ def teasor_to_list(gold_outputs, predicted_outputs):
 def eval_step(model: nn.Module,
               criterion: nn.Module,
               max_out_len: int,
+              vocabs: Vocabs,
               batch: Dict[str, torch.tensor]):
     inputs = batch['sentence']
     inputs_lengths = batch['sentence_lengts']
@@ -136,7 +150,7 @@ def eval_step(model: nn.Module,
 
     logits, predictions = model(inputs, inputs_lengths, max_out_length=max_out_len)
 
-    f_score = compute_fScore(gold_outputs, predictions)
+    f_score = compute_fScore(gold_outputs, predictions, vocabs)
 
     gold_output_len = gold_outputs.shape[0]
     padded_gold_outputs = torch_pad(
@@ -146,7 +160,9 @@ def eval_step(model: nn.Module,
 
 
 def evaluate_model(model: nn.Module,
+                   criterion: nn.Module,
                    max_out_len: int,
+                   vocabs: Vocabs,
                    data_loader: DataLoader):
     model.eval()
     with torch.no_grad():
@@ -154,7 +170,8 @@ def evaluate_model(model: nn.Module,
         epoch_loss = 0
         no_batches = 0
         for batch in data_loader:
-            f_score_epoch, loss = eval_step(model, criterion, max_out_len, batch)
+            f_score_epoch, loss = eval_step(
+                model, criterion, max_out_len, vocabs, batch)
             epoch_f_score += f_score_epoch
             epoch_loss += loss
             no_batches += 1
@@ -182,13 +199,15 @@ def train_step(model: nn.Module,
 def train_model(model: nn.Module,
                 criterion: nn.Module,
                 optimizer: Optimizer,
+                no_epochs: int,
                 max_out_len: int,
+                vocabs: Vocabs,
                 train_data_loader: DataLoader,
                 dev_data_loader: DataLoader,
                 train_writer: SummaryWriter,
                 eval_writer: SummaryWriter):
     model.train()
-    for epoch in range(NO_EPOCHS):
+    for epoch in range(no_epochs):
         start_time = time.time()
         i = 0
         epoch_loss = 0
@@ -198,7 +217,8 @@ def train_model(model: nn.Module,
             epoch_loss += batch_loss
             no_batches += 1
         epoch_loss = epoch_loss / no_batches
-        fscore, dev_loss = evaluate_model(model, max_out_len, dev_data_loader)
+        fscore, dev_loss = evaluate_model(
+            model, criterion, max_out_len, vocabs, dev_data_loader)
         model.train()
         end_time = time.time()
         time_passed = end_time - start_time
@@ -208,8 +228,8 @@ def train_model(model: nn.Module,
         eval_writer.add_scalar('loss', dev_loss, epoch)
         eval_writer.add_scalar('f-score', fscore, epoch)
 
-
-if __name__ == "__main__":
+def main(_):
+    #TODO: move to new file.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print('Training on device', device)
 
@@ -228,13 +248,24 @@ if __name__ == "__main__":
     max_out_len = train_dataset.max_concepts_length
 
     train_data_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, collate_fn=train_dataset.collate_fn)
+        train_dataset, batch_size=FLAGS.batch_size,
+        collate_fn=train_dataset.collate_fn)
     dev_data_loader = DataLoader(
-        dev_dataset, batch_size=DEV_BATCH_SIZE, collate_fn=dev_dataset.collate_fn)
+        dev_dataset, batch_size=FLAGS.dev_batch_size,
+        collate_fn=dev_dataset.collate_fn)
+
+    # Construct config object.
+    cfg = get_default_config()
+    if FLAGS.config:
+      config_file_name = FLAGS.config
+      config_path = os.path.join('configs', config_file_name)
+      cfg.merge_from_file(config_path)
+      cfg.freeze()
 
     model = Seq2seq(
         vocabs.token_vocab_size,
         vocabs.concept_vocab_size,
+        cfg.CONCEPT_IDENTIFICATION.LSTM_BASED,
         device=device).to(device)
     optimizer = optim.Adam(model.parameters())
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
@@ -246,6 +277,13 @@ if __name__ == "__main__":
     train_writer = SummaryWriter(tensorboard_dir + "/train")
     eval_writer = SummaryWriter(tensorboard_dir + "/eval")
     train_model(
-        model, criterion, optimizer, max_out_len, train_data_loader, dev_data_loader, train_writer, eval_writer)
+        model, criterion, optimizer, FLAGS.no_epochs,
+        max_out_len, vocabs,
+        train_data_loader, dev_data_loader,
+        train_writer, eval_writer)
     train_writer.close()
     eval_writer.close()
+
+
+if __name__ == "__main__":
+    app.run(main)
