@@ -12,12 +12,21 @@ from torch.nn.functional import pad as torch_pad
 from torch.optim import Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
+from data_pipeline.dummy.dummy_dataset import DummySeq2SeqDataset, BOS
+from data_pipeline.dummy.dummy_vocab import DummyVocabs
 from data_pipeline.data_reading import get_paths
 from data_pipeline.vocab import Vocabs
 from data_pipeline.dataset import PAD, EOS, UNK, PAD_IDX
 from data_pipeline.dataset import AMRDataset
 from config import get_default_config
 from models import Seq2seq
+from model.transformer import TransformerSeq2Seq
+
+import string
+import random
+
+SIZE = 64
+DEV_SIZE = 32
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('config',
@@ -40,6 +49,12 @@ flags.DEFINE_integer('no_epochs',
                      short_name='e',
                      default=20,
                      help=('Number of epochs.'))
+flags.DEFINE_boolean('dummy',
+                    default=False,
+                    help=('Dataset selection - dummy or default.'))
+flags.DEFINE_boolean('transformer',
+                    default=False,
+                    help=('Model selection - transformer or LSTM.'))
 
 def compute_loss(criterion, logits, gold_outputs):
   """Computes cross entropy loss.
@@ -231,32 +246,63 @@ def train_model(model: nn.Module,
     eval_writer.add_scalar('loss', dev_loss, epoch)
     eval_writer.add_scalar('f-score', fscore, epoch)
 
+def generate_sentences():
+  all_sentences = []
+  all_sentences_dev = []
+  for i in range(SIZE):
+      # Generate random string
+      letters = string.ascii_lowercase
+      sentence = ''.join(random.choice(letters) for i in range(10))
+      all_sentences.append(sentence)
+  print("all training sentences", all_sentences)
+  for i in range(DEV_SIZE):
+      letters = string.ascii_lowercase
+      sentence = ''.join(random.choice(letters) for i in range(10))
+      all_sentences_dev.append(sentence)
+  print("all dev sentences", all_sentences_dev)
+
+  special_words = ([PAD, BOS, EOS, UNK], [PAD, BOS, EOS, UNK], [PAD, BOS, EOS])
+  vocabs = DummyVocabs(all_sentences, UNK, special_words, min_frequencies=(1, 1, 1))
+
+  return all_sentences, all_sentences_dev, vocabs
+
 def main(_):
   #TODO: move to new file.
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print('Training on device', device)
 
-  if FLAGS.train_subsets is None:
-    train_subsets = ['bolt', 'cctv', 'dfa', 'dfb', 'guidelines',
-                      'mt09sdl', 'proxy', 'wb', 'xinhua']
-  else:
-    # Take subsets from flag passed.
-    train_subsets = FLAGS.train_subsets.split(',')
-  if FLAGS.dev_subsets is None:
-    dev_subsets = ['bolt', 'consensus', 'dfa', 'proxy', 'xinhua']
-  else:
-    # Take subsets from flag passed.
-    dev_subsets = FLAGS.dev_subsets.split(',')
+  if not FLAGS.dummy:
+    if FLAGS.train_subsets is None:
+      train_subsets = ['bolt', 'cctv', 'dfa', 'dfb', 'guidelines',
+                        'mt09sdl', 'proxy', 'wb', 'xinhua']
+    else:
+      # Take subsets from flag passed.
+      train_subsets = FLAGS.train_subsets.split(',')
+    if FLAGS.dev_subsets is None:
+      dev_subsets = ['bolt', 'consensus', 'dfa', 'proxy', 'xinhua']
+    else:
+      # Take subsets from flag passed.
+      dev_subsets = FLAGS.dev_subsets.split(',')
 
-  train_paths = get_paths('training', train_subsets)
-  dev_paths = get_paths('dev', dev_subsets)
+    train_paths = get_paths('training', train_subsets)
+    dev_paths = get_paths('dev', dev_subsets)
 
-  special_words = ([PAD, EOS, UNK], [PAD, EOS, UNK], [PAD, UNK, None])
-  vocabs = Vocabs(train_paths, UNK, special_words, min_frequencies=(1, 1, 1))
-  train_dataset = AMRDataset(
-    train_paths, vocabs, device, seq2seq_setting=True, ordered=True)
-  dev_dataset = AMRDataset(
-    dev_paths, vocabs, device, seq2seq_setting=True, ordered=True)
+    special_words = ([PAD, EOS, UNK], [PAD, EOS, UNK], [PAD, UNK, None])
+    vocabs = Vocabs(train_paths, UNK, special_words, min_frequencies=(1, 1, 1))
+    train_dataset = AMRDataset(
+      train_paths, vocabs, device, seq2seq_setting=True, ordered=True)
+    dev_dataset = AMRDataset(
+      dev_paths, vocabs, device, seq2seq_setting=True, ordered=True)
+  else: 
+    all_sentences, all_sentences_dev, vocabs = generate_sentences()
+
+    train_dataset = DummySeq2SeqDataset(all_sentences,
+                                        vocabs,
+                                        device)
+    dev_dataset = DummySeq2SeqDataset(all_sentences_dev,
+                                      vocabs,
+                                      device)
+
   max_out_len = train_dataset.max_concepts_length
 
   train_data_loader = DataLoader(
@@ -274,11 +320,18 @@ def main(_):
     cfg.merge_from_file(config_path)
     cfg.freeze()
 
-  model = Seq2seq(
-    vocabs.token_vocab_size,
-    vocabs.concept_vocab_size,
-    cfg.CONCEPT_IDENTIFICATION.LSTM_BASED,
-    device=device).to(device)
+  if FLAGS.transformer:
+      model = TransformerSeq2Seq(vocabs.token_vocab_size,
+                             vocabs.concept_vocab_size,
+                             cfg.CONCEPT_IDENTIFICATION.TRANSF_BASED,
+                             device=device).to(device) 
+  else: 
+    model = Seq2seq(
+      vocabs.token_vocab_size,
+      vocabs.concept_vocab_size,
+      cfg.CONCEPT_IDENTIFICATION.LSTM_BASED,
+      device=device).to(device)
+
   optimizer = optim.Adam(model.parameters())
   criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
