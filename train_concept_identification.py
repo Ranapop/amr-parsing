@@ -2,6 +2,7 @@ import os
 from typing import Dict
 import time
 import string
+import pprint
 import random
 
 from absl import app
@@ -24,9 +25,9 @@ from config import get_default_config
 from models import Seq2seq
 from model.transformer import TransformerSeq2Seq
 
-
-SIZE = 640
-DEV_SIZE = 320
+DUMMY_TRAIN_SIZE = 140
+DUMMY_DEV_SIZE = 40
+DUMMY_LEN = 10
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('config',
@@ -37,7 +38,7 @@ flags.DEFINE_string('train_subsets',
                     help=('Train subsets split by comma. Ex: bolt,proxy'))
 flags.DEFINE_string('dev_subsets',
                     default=None,
-                    help=('Train subsets split by comma. Ex: bolt,proxy'))
+                    help=('Dev subsets split by comma. Ex: bolt,proxy'))
 flags.DEFINE_integer('batch_size',
                      default=32,
                      short_name='b',
@@ -55,6 +56,9 @@ flags.DEFINE_boolean('dummy',
 flags.DEFINE_boolean('transformer',
                      default=False,
                      help=('Model selection - transformer or LSTM.'))
+flags.DEFINE_boolean('train_is_test',
+                     default=False,
+                     help=('Train and test on same dataset.'))
 
 def compute_loss(criterion, logits, gold_outputs):
   """Computes cross entropy loss.
@@ -90,11 +94,18 @@ def compute_fScore(gold_outputs,
     f_score
   """
 
-  eos_index= list(vocabs.concept_vocab.keys()).index(EOS)
-  concepts_as_list_predicted, concepts_as_list_gold = tensor_to_list(gold_outputs, predicted_outputs, eos_index, vocabs)
+  eos_index = list(vocabs.concept_vocab.keys()).index(EOS)
+  concepts_as_list_predicted, concepts_as_list_gold, gold_display, predicted_display = tensor_to_list(gold_outputs, predicted_outputs, eos_index, vocabs)
 
   print("concepts_as_list_gold", concepts_as_list_gold)
   print("concepts_as_list_predicted", concepts_as_list_predicted)
+
+  pp = pprint.PrettyPrinter(indent=1)
+  print("concepts_as_list_gold")
+  pp.pprint(gold_display)
+  print("concepts_as_list_predicted")
+  for pred in predicted_display:
+    print(pred)
 
   true_positive = len(set(concepts_as_list_gold) & set(concepts_as_list_predicted))
   false_positive = len(set(concepts_as_list_predicted).difference(set(concepts_as_list_gold)))
@@ -121,13 +132,13 @@ def tensor_to_list(gold_outputs,
   # Extract padding from original outputs
   gold_list_no_padding = extract_padding(gold_outputs, eos_index)
   predicted_list_no_padding = extract_padding(predicted_outputs, eos_index)
-
+ 
   # Remove UNK from the sequence
   # TODO store the gold data before numericalization and use it here
-  concepts_as_list_gold = indices_to_words(gold_list_no_padding, vocabs)
-  concepts_as_list_predicted = indices_to_words(predicted_list_no_padding, vocabs)
+  concepts_as_list_gold, gold_display = indices_to_words(gold_list_no_padding, vocabs)
+  concepts_as_list_predicted, predicted_display = indices_to_words(predicted_list_no_padding, vocabs)
 
-  return concepts_as_list_predicted, concepts_as_list_gold
+  return concepts_as_list_predicted, concepts_as_list_gold, gold_display, predicted_display
 
 
 def extract_padding(outputs, eos_index):
@@ -156,7 +167,13 @@ def indices_to_words(outputs_no_padding,
   concepts_as_list = [ids_to_concepts_list[int(id)]\
                         for sentence in outputs_no_padding for id in sentence\
                         if ids_to_concepts_list[int(id)] != UNK]
-  return concepts_as_list
+  list_for_display = []
+  for sentence in outputs_no_padding:
+    indices_words = [ids_to_concepts_list[int(id)]\
+                        for id in sentence\
+                        if ids_to_concepts_list[int(id)] != UNK]
+    list_for_display.append(indices_words)
+  return concepts_as_list, list_for_display
 
 
 def eval_step(model: nn.Module,
@@ -168,7 +185,7 @@ def eval_step(model: nn.Module,
   inputs_lengths = batch['sentence_lengts']
   gold_outputs = batch['concepts']
 
-  logits, predictions = model(inputs, inputs_lengths, max_out_length=max_out_len)
+  logits, predictions = model(inputs, inputs_lengths, gold_outputs, max_out_length=max_out_len)
 
   f_score = compute_fScore(gold_outputs, predictions, vocabs)
 
@@ -202,13 +219,21 @@ def evaluate_model(model: nn.Module,
 def train_step(model: nn.Module,
                criterion: nn.Module,
                optimizer: Optimizer,
-               batch: Dict[str, torch.Tensor]):
+               batch: Dict[str, torch.Tensor],
+               vocabs: Vocabs):
   inputs = batch['sentence']
   inputs_lengths = batch['sentence_lengts']
   gold_outputs = batch['concepts']
 
   optimizer.zero_grad()
   logits, predictions = model(inputs, inputs_lengths, gold_outputs)
+
+  eos_index = list(vocabs.concept_vocab.keys()).index(EOS)
+  predictions_to_words = indices_to_words(extract_padding(predictions, eos_index), vocabs)
+  print("train predictions")
+  for pred in predictions_to_words:
+    print(pred)
+
   loss = compute_loss(criterion, logits, gold_outputs)
   loss.backward()
   optimizer.step()
@@ -231,9 +256,9 @@ def train_model(model: nn.Module,
     epoch_loss = 0
     no_batches = 0
     for batch in train_data_loader:
-        batch_loss = train_step(model, criterion, optimizer, batch)
-        epoch_loss += batch_loss
-        no_batches += 1
+      batch_loss = train_step(model, criterion, optimizer, batch, vocabs)
+      epoch_loss += batch_loss
+      no_batches += 1
     epoch_loss = epoch_loss / no_batches
     fscore, dev_loss = evaluate_model(
         model, criterion, max_out_len, vocabs, dev_data_loader)
@@ -248,17 +273,22 @@ def train_model(model: nn.Module,
 
 
 def generate_sentences():
+  """
+    Generates random sentences of length DUMMY_LEN for dummy dataset.
+
+    Returns:
+      Train Sentences, Test Sentences, Dummy Vocabs
+  """
   all_sentences = []
   all_sentences_dev = []
-  for i in range(SIZE):
-    # Generate random string
+  for i in range(DUMMY_TRAIN_SIZE):
     letters = string.ascii_lowercase
-    sentence = ''.join(random.choice(letters) for i in range(10))
+    sentence = ''.join(random.choice(letters) for i in range(DUMMY_LEN))
     all_sentences.append(sentence)
   print("all training sentences", all_sentences)
-  for i in range(DEV_SIZE):
+  for i in range(DUMMY_DEV_SIZE):
     letters = string.ascii_lowercase
-    sentence = ''.join(random.choice(letters) for i in range(10))
+    sentence = ''.join(random.choice(letters) for i in range(DUMMY_LEN))
     all_sentences_dev.append(sentence)
   print("all dev sentences", all_sentences_dev)
 
@@ -292,9 +322,9 @@ def main(_):
     special_words = ([PAD, EOS, UNK], [PAD, EOS, UNK], [PAD, UNK, None])
     vocabs = Vocabs(train_paths, UNK, special_words, min_frequencies=(1, 1, 1))
     train_dataset = AMRDataset(
-      train_paths, vocabs, device, seq2seq_setting=True, ordered=True)
+        train_paths, vocabs, device, seq2seq_setting=True, ordered=True)
     dev_dataset = AMRDataset(
-      dev_paths, vocabs, device, seq2seq_setting=True, ordered=True)
+        dev_paths, vocabs, device, seq2seq_setting=True, ordered=True)
   else:
     all_sentences, all_sentences_dev, vocabs = generate_sentences()
 
@@ -330,10 +360,10 @@ def main(_):
     tensorboard_dir = 'temp/concept_identification_transf'
   else:
     model = Seq2seq(
-      vocabs.token_vocab_size,
-      vocabs.concept_vocab_size,
-      cfg.CONCEPT_IDENTIFICATION.LSTM_BASED,
-      device=device).to(device)
+        vocabs.token_vocab_size,
+        vocabs.concept_vocab_size,
+        cfg.CONCEPT_IDENTIFICATION.LSTM_BASED,
+        device=device).to(device)
     tensorboard_dir = 'temp/concept_identification'
 
   optimizer = optim.Adam(model.parameters())
@@ -344,11 +374,18 @@ def main(_):
       os.makedirs(tensorboard_dir)
   train_writer = SummaryWriter(tensorboard_dir + "/train")
   eval_writer = SummaryWriter(tensorboard_dir + "/eval")
-  train_model(
-    model, criterion, optimizer, FLAGS.no_epochs,
-    max_out_len, vocabs,
-    train_data_loader, dev_data_loader,
-    train_writer, eval_writer)
+  if FLAGS.train_is_test:
+    train_model(
+        model, criterion, optimizer, FLAGS.no_epochs,
+        max_out_len, vocabs,
+        train_data_loader, train_data_loader,
+        train_writer, eval_writer)
+  else:
+    train_model(
+        model, criterion, optimizer, FLAGS.no_epochs,
+        max_out_len, vocabs,
+        train_data_loader, dev_data_loader,
+        train_writer, eval_writer)
   train_writer.close()
   eval_writer.close()
 
